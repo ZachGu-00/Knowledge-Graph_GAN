@@ -1,0 +1,51 @@
+# Data files
+*.pkl
+*.json
+*.pt
+*.pth
+
+# Temporary files
+*.tmp
+*.temp
+*~
+
+# Directories with data
+data/
+embeddings/
+graph/
+query/
+checkpoints/
+selected_*_samples.json
+training_log_*.json
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.env
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Documentation (exclude except README)
+PROJECT_DOCUMENTATION.md
+*.txt
+*.docx
+*.pdf
+
+# Jupyter notebooks
+*.ipynb
+
+# Log files
+*.log
