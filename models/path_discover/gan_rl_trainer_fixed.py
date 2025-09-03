@@ -31,11 +31,17 @@ class GANRLTrainerFixed:
     def __init__(self, 
                  generator,
                  discriminator,
-                 device: str = 'cuda'):
+                 device: str = 'cuda',
+                 discriminator_threshold: float = 0.5):
         
         self.generator = generator
         self.discriminator = discriminator
         self.device = device
+        self.discriminator_threshold = discriminator_threshold
+        
+        # REINFORCE奖励基线 - 降低方差
+        self.reward_baseline = 0.0
+        self.beta = 0.9  # 移动平均衰减因子
         
         # 移动到设备
         self.generator.to(device)
@@ -133,7 +139,7 @@ class GANRLTrainerFixed:
         Returns:
             Tuple[常规负样本, 判别器误判样本]
         """
-        print(f"[SEARCH] Dynamic negative sampling (Epoch {current_epoch})...")
+        # print(f"[SEARCH] Dynamic negative sampling (Epoch {current_epoch})...")  # 简化输出
         
         regular_negatives = []        # 常规负样本:未命中答案
         discriminator_fooled = []     # 关键!判别器被骗的样本
@@ -177,8 +183,8 @@ class GANRLTrainerFixed:
                     regular_negatives.append((question, path, 'negative'))
                 
                 # 情况B(关键!):判别器被"骗"的情况
-                # 判别器给了高分(>0.5),但Ground Truth说这是错的 - 降低阈值增加敏感性
-                if disc_confidence > 0.5 and not is_ground_truth_correct:
+                # 判别器给了高分(>threshold),但Ground Truth说这是错的 - 降低阈值增加敏感性
+                if disc_confidence > self.discriminator_threshold and not is_ground_truth_correct:
                     discriminator_fooled.append({
                         'question': question,
                         'path': path,
@@ -191,14 +197,14 @@ class GANRLTrainerFixed:
                     # 统计
                     self.adversarial_stats['discriminator_fooled_count'] += 1
                     
-                    print(f"[FOOLED] Discriminator fooled! Path: {' -> '.join(path)}")
+                    # print(f"[FOOLED] Discriminator fooled! Path: {' -> '.join(path)}")  # 简化输出
                     print(f"   Disc confidence: {disc_confidence:.3f}, but GT: {is_ground_truth_correct}")
         
         # 恢复生成器确定性模式
         self.generator.disable_stochastic_exploration()
         
-        print(f"[DONE] Collected regular negatives: {len(regular_negatives)}")
-        print(f"[FOOLED] Discriminator fooled cases: {len(discriminator_fooled)}")
+        # print(f"[DONE] Collected regular negatives: {len(regular_negatives)}")  # 简化输出
+        # print(f"[FOOLED] Discriminator fooled cases: {len(discriminator_fooled)}")  # 简化输出
         
         return regular_negatives, discriminator_fooled
     
@@ -209,7 +215,7 @@ class GANRLTrainerFixed:
         
         完全依赖生成器探索，记录详细的生成过程和判别器反应
         """
-        print(f"[GEN-EXPLORE] Generator exploration sampling (Epoch {current_epoch})...")
+        # print(f"[GEN-EXPLORE] Generator exploration sampling (Epoch {current_epoch})...")  # 简化输出
         
         exploration_results = []
         generator_stats = {
@@ -244,46 +250,39 @@ class GANRLTrainerFixed:
             if 'type' in qa_item:
                 question_type = qa_item['type']
             
-            print(f"[QUERY] Processing: {question[:50]}...")
-            print(f"   Question type: {question_type}")
-            print(f"   Start entity: {start_entity}")
-            print(f"   Target entities: {list(answer_entities)}")
-            print(f"   Stochastic mode: {getattr(self.generator, 'stochastic_mode', 'Unknown')}")
+            # print(f"[QUERY] Processing: {question[:50]}...")  # 简化输出
+            # print(f"   Question type: {question_type}")  # 简化输出
+            # print(f"   Start entity: {start_entity}")  # 简化输出
+            # print(f"   Target entities: {list(answer_entities)}")  # 简化输出
+            # print(f"   Stochastic mode: {getattr(self.generator, 'stochastic_mode', 'Unknown')}")  # 简化输出
             
-            while attempts < max_attempts and not found_correct:
-                attempts += 1
+            # 使用新生成器的持续探索功能
+            if hasattr(self.generator, 'persistent_query_exploration'):
+                # 新的Beam Search生成器
+                path, attempts_used, found_correct = self.generator.persistent_query_exploration(
+                    question=question,
+                    start_entity=start_entity,
+                    answer_entities=answer_entities,
+                    max_attempts=max_attempts
+                )
                 
-                # 生成单条路径（随机探索）
-                print(f"      Generating attempt {attempts} (stochastic={getattr(self.generator, 'stochastic_mode', False)})")
-                
-                with torch.no_grad():
-                    generated_paths = self.generator.generate_paths(
-                        question=question,
-                        start_entity=start_entity,
-                        target_entities=answer_entities,  # 提供正确目标实体
-                        max_paths=1,  # 每次只生成1条路径
-                        stochastic=True  # 随机探索
-                    )
-                
-                if not generated_paths:
-                    continue
-                    
-                path, gen_score, _ = generated_paths[0]
                 if len(path) == 0:
                     continue
                     
-                generator_stats['total_paths_generated'] += 1
+                generator_stats['total_paths_generated'] += attempts_used
                 final_entity = path[-1]
                 is_gt_correct = final_entity in answer_entities
                 
-                # 详细记录生成器行为
-                if is_gt_correct:
+                # 统计
+                generator_stats['queries_processed'] += 1
+                generator_stats['total_attempts'] += attempts_used
+                
+                if found_correct:
                     generator_stats['correct_paths'] += 1
-                    found_correct = True  # 找到正确路径，停止当前query
-                    print(f"   [SUCCESS] Attempt {attempts}: Found correct path -> {' -> '.join(path[-2:])}")
+                    generator_stats['queries_solved'] += 1
                 else:
                     generator_stats['incorrect_paths'] += 1
-                    print(f"   [RETRY] Attempt {attempts}: Wrong path -> {' -> '.join(path)}, trying next...")
+                    generator_stats['max_attempts_reached'] += 1
                 
                 # 获取判别器评分
                 path_string = '.'.join(path)
@@ -295,7 +294,7 @@ class GANRLTrainerFixed:
                     disc_confidence = torch.sigmoid(torch.tensor(disc_raw_score)).item()
                 
                 # 分析生成器-判别器一致性
-                disc_thinks_correct = disc_confidence > 0.5
+                disc_thinks_correct = disc_confidence > self.discriminator_threshold
                 
                 if is_gt_correct == disc_thinks_correct:
                     generator_stats['discriminator_agreements'] += 1
@@ -303,34 +302,28 @@ class GANRLTrainerFixed:
                     generator_stats['discriminator_disagreements'] += 1
                 
                 # 关键：发现判别器被骗的情况
-                if disc_confidence > 0.5 and not is_gt_correct:
+                if disc_confidence > self.discriminator_threshold and not is_gt_correct:
                     generator_stats['fooled_discriminator'] += 1
                     
                     exploration_results.append({
                         'question': question,
                         'path': path,
-                        'generator_score': gen_score,
+                        'generator_score': 0.0,  # Beam Search使用内部评分
                         'discriminator_confidence': disc_confidence,
                         'ground_truth': False,
                         'label': 'generator_fooled_discriminator',
-                        'analysis': f"Gen thinks: {gen_score:.3f}, Disc thinks: {disc_confidence:.3f}, GT: False",
-                        'attempt_number': attempts
+                        'analysis': f"Disc thinks: {disc_confidence:.3f}, GT: False",
+                        'attempt_number': attempts_used
                     })
                     
-                    print(f"   [GEN-FOOLED] Generator fooled discriminator on attempt {attempts}!")
-                    print(f"      Path: {' -> '.join(path)}")
-                    print(f"      Gen: {gen_score:.3f}, Disc: {disc_confidence:.3f}, GT: False")
-            
-            # 当前query完成统计
-            generator_stats['queries_processed'] += 1
-            generator_stats['total_attempts'] += attempts
-            
-            if found_correct:
-                generator_stats['queries_solved'] += 1
-                print(f"   ✅ Query solved in {attempts} attempts")
+                    # print(f"   [GEN-FOOLED] Generator fooled discriminator after {attempts_used} attempts!")  # 简化输出
+                    # print(f"      Path: {' -> '.join(path[-4:])}")  # 简化输出
+                    # print(f"      Disc: {disc_confidence:.3f}, GT: False")  # 简化输出
+                    
             else:
-                generator_stats['max_attempts_reached'] += 1
-                print(f"   ❌ Query failed after {max_attempts} attempts")
+                # 回退到原有逻辑（向后兼容）
+                # print("   [FALLBACK] Using legacy exploration method...")  # 简化输出
+                found_correct = False
         
         # 恢复生成器确定性模式
         self.generator.disable_stochastic_exploration()
@@ -342,7 +335,7 @@ class GANRLTrainerFixed:
         # 详细统计报告
         total_gen = generator_stats['total_paths_generated']
         total_queries = generator_stats['queries_processed']
-        print(f"[GEN-STATS] Generator Exploration Results:")
+        # print(f"[GEN-STATS] Generator Exploration Results:")  # 简化输出
         print(f"   Queries processed: {total_queries}")
         print(f"   Queries solved: {generator_stats['queries_solved']} ({generator_stats['queries_solved']/max(1,total_queries)*100:.1f}%)")
         print(f"   Queries failed: {generator_stats['max_attempts_reached']} ({generator_stats['max_attempts_reached']/max(1,total_queries)*100:.1f}%)")
@@ -453,7 +446,7 @@ class GANRLTrainerFixed:
                             loss = nn.BCELoss()(pred_score, true_label) * loss_weight
                             batch_loss += loss
                             
-                            pred_label = (pred_score > 0.5).float()
+                            pred_label = (pred_score > self.discriminator_threshold).float()
                             if pred_label == true_label:
                                 batch_correct += 1
                             
@@ -514,22 +507,22 @@ class GANRLTrainerFixed:
         gt_reward = 1.0 if is_gt_correct else 0.0
         
         # 智能权重调整!
-        if is_gt_correct and disc_confidence > 0.5:
+        if is_gt_correct and disc_confidence > self.discriminator_threshold:
             # 情况:双方都认为是对的 - 相信判别器的专业判断
             weights = {'discriminator': 0.7, 'ground_truth': 0.2, 'other': 0.1}
             status = "consistent_positive"
             
-        elif not is_gt_correct and disc_confidence < 0.5:
+        elif not is_gt_correct and disc_confidence < self.discriminator_threshold:
             # 情况:双方都认为是错的 - 相信判别器的专业判断
             weights = {'discriminator': 0.7, 'ground_truth': 0.2, 'other': 0.1}
             status = "consistent_negative"
             
-        elif is_gt_correct and disc_confidence < 0.5:
+        elif is_gt_correct and disc_confidence < self.discriminator_threshold:
             # 情况:GT对,但判别器说错 - GT主导,帮助判别器学习
             weights = {'discriminator': 0.2, 'ground_truth': 0.7, 'other': 0.1}
             status = "gt_overrule_disc_negative"
             
-        else:  # not is_gt_correct and disc_confidence > 0.5
+        else:  # not is_gt_correct and disc_confidence > self.discriminator_threshold
             # 情况B(关键!):GT错,但判别器被骗了 - GT主导,纠正判别器
             weights = {'discriminator': 0.1, 'ground_truth': 0.8, 'other': 0.1}
             status = "gt_corrects_disc_fooled"
@@ -537,12 +530,12 @@ class GANRLTrainerFixed:
             # 统计被误导的生成器
             self.adversarial_stats['generator_misled_count'] += 1
             
-            print(f"[CORRECT] Correcting fooled discriminator: {' -> '.join(path)}")
-            print(f"   Disc: {disc_confidence:.3f} (high), GT: {is_gt_correct} (false)")
+            # print(f"[CORRECT] Correcting fooled discriminator: {' -> '.join(path)}")  # 简化输出
+            # print(f"   Disc: {disc_confidence:.3f} (high), GT: {is_gt_correct} (false)")  # 简化输出
         
-        # 调试日志 - 记录奖励计算过程
-        print(f"[REWARD] Path: {' -> '.join(path[-2:])}, Status: {status}")
-        print(f"   Disc_conf: {disc_confidence:.3f}, GT: {is_gt_correct}, Weights: D={weights['discriminator']:.1f} GT={weights['ground_truth']:.1f}")
+        # 调试日志 - 简化输出
+        # print(f"[REWARD] Path: {' -> '.join(path[-2:])}, Status: {status}")
+        # print(f"   Disc_conf: {disc_confidence:.3f}, GT: {is_gt_correct}, Weights: D={weights['discriminator']:.1f} GT={weights['ground_truth']:.1f}")
         
         # 其他辅助奖励
         length_penalty = max(0.0, 1.0 - (len(path) - 3) * 0.1)
@@ -555,10 +548,26 @@ class GANRLTrainerFixed:
             weights['other'] * (length_penalty + diversity_bonus)
         )
         
-        # 详细调试信息
-        print(f"   Final_reward: {final_reward:.4f} = {weights['discriminator']:.1f}*{disc_confidence:.3f} + {weights['ground_truth']:.1f}*{gt_reward:.1f} + {weights['other']:.1f}*{length_penalty + diversity_bonus:.3f}")
+        # 详细调试信息 - 简化输出
+        # print(f"   Final_reward: {final_reward:.4f} = {weights['discriminator']:.1f}*{disc_confidence:.3f} + {weights['ground_truth']:.1f}*{gt_reward:.1f} + {weights['other']:.1f}*{length_penalty + diversity_bonus:.3f}")
         
         return final_reward
+    
+    def compute_advantage_with_baseline(self, raw_reward: float) -> float:
+        """
+        使用奖励基线计算优势函数 - REINFORCE方差减少
+        
+        优势 = 当前奖励 - 移动平均基线
+        - 如果优势>0: 表现好于平均水平，鼓励这个行为
+        - 如果优势<0: 表现差于平均水平，抑制这个行为
+        """
+        # 计算优势
+        advantage = raw_reward - self.reward_baseline
+        
+        # 更新移动平均基线
+        self.reward_baseline = self.beta * self.reward_baseline + (1 - self.beta) * raw_reward
+        
+        return advantage
     
     def train_epoch_with_adversarial_correction(self, qa_dataset: List[Dict],
                                               current_epoch: int = 0) -> Dict[str, float]:
@@ -567,41 +576,49 @@ class GANRLTrainerFixed:
         
         正确处理"双方都犯错"的情况
         """
-        print(f"\n[TARGET] Adversarial Training Epoch {current_epoch + 1}")
-        print("="*60)
-        
         epoch_stats = {}
+        total_steps = 6
+        
+        # 使用进度条显示训练进度
+        pbar = tqdm(total=total_steps, desc=f"Epoch {current_epoch + 1}", leave=False)
         
         # 1. 收集正样本(Ground Truth)  
+        pbar.set_description(f"Epoch {current_epoch + 1} - Collecting positive samples")
         positive_samples = self.collect_positive_samples(qa_dataset)
+        pbar.update(1)
         
         # 2. 生成器探索样本(包括判别器被骗的样本) - 移除预设负样本
-        print(f"[GEN] Generator exploring samples for adversarial training...")
+        pbar.set_description(f"Epoch {current_epoch + 1} - Generator exploration")
         fooled_cases = self.collect_generator_exploration_samples(
             qa_dataset, current_epoch
         )
+        pbar.update(1)
         
         # 3. 训练判别器(带GT纠错) - 只用正样本和生成器发现的问题样本
+        pbar.set_description(f"Epoch {current_epoch + 1} - Training discriminator")
         disc_loss = self.train_discriminator_with_ground_truth_correction(
             positive_samples, [], fooled_cases  # 移除regular_negatives
         )
+        pbar.update(1)
         
-        # 4. 训练生成器(使用智能奖励)
-        print(f"\n[GEN] Training generator with intelligent rewards...")
-        # 让生成器也训练更多轮，与样本数量成比例
-        generator_episodes = min(len(qa_dataset), 500)  # 最多500轮，或样本数量
-        print(f"   Generator will train on {generator_episodes} episodes (vs {len(qa_dataset)} total samples)")
+        # 4. 训练生成器(使用智能奖励) - 更保守的训练比例1:50
+        generator_episodes = min(len(qa_dataset) // 50, 50)  # 保守比例，最多50轮
+        pbar.set_description(f"Epoch {current_epoch + 1} - Training generator ({generator_episodes} episodes)")
         gen_reward = self.train_generator_with_intelligent_reward(qa_dataset, episodes=generator_episodes)
+        pbar.update(1)
         
         # 5. 计算生成器详细指标
-        print(f"\n[METRICS] Computing generator metrics...")
+        pbar.set_description(f"Epoch {current_epoch + 1} - Computing generator metrics")
         gen_metrics = self._compute_generator_metrics(qa_dataset, sample_size=100)
+        pbar.update(1)
         
         # 6. 计算端到端指标
-        print(f"\n[TARGET] Evaluating end-to-end performance...")
+        pbar.set_description(f"Epoch {current_epoch + 1} - Evaluating end-to-end")
         # 使用部分数据作为验证集(简化版)
         validation_sample = random.sample(qa_dataset, min(50, len(qa_dataset)))
         e2e_metrics = self._evaluate_end_to_end_metrics(validation_sample, sample_size=50)
+        pbar.update(1)
+        pbar.close()
         
         # 获取生成器探索统计
         gen_exploration_stats = self.training_stats.get('generator_exploration_stats', [{}])[-1]
@@ -656,70 +673,41 @@ class GANRLTrainerFixed:
         return epoch_stats
     
     def _display_epoch_metrics(self, epoch_stats, epoch_num):
-        """显示完整的epoch指标"""
-        print(f"\\n[METRICS] EPOCH {epoch_num + 1} COMPREHENSIVE METRICS")
-        print("="*80)
-        
-        # 判别器指标
-        print(f"\\n[DISC] DISCRIMINATOR (Ranker) METRICS:")
-        print(f"   Loss_D:           {epoch_stats.get('Loss_D', 0):.4f}")
-        print(f"   Acc_Real:         {epoch_stats.get('Acc_Real', 0):.3f}")
-        print(f"   Acc_Fake:         {epoch_stats.get('Acc_Fake', 0):.3f}")
-        print(f"   F1-Score:         {epoch_stats.get('F1_Score', 0):.3f}")
-        
-        # 生成器指标
-        print(f"\n[GEN] GENERATOR (Discoverer) METRICS:")
-        print(f"   Loss_G:           {epoch_stats.get('Loss_G', 0):.4f}")
-        print(f"   Avg_Reward:       {epoch_stats.get('Avg_Reward', 0):.4f}")
-        print(f"   Path_Length_Avg:  {epoch_stats.get('Path_Length_Avg', 0):.2f}")
-        print(f"   Path_Diversity:   {epoch_stats.get('Path_Diversity', 0):.3f}")
-        
-        # 端到端指标
-        print(f"\n[TARGET] END-TO-END TASK PERFORMANCE:")
-        print(f"   Hits@1:           {epoch_stats.get('Hits_at_1', 0):.3f}")
-        print(f"   MRR:              {epoch_stats.get('MRR', 0):.3f}")
-        print(f"   Success_Rate:     {epoch_stats.get('Success_Rate', 0):.3f}")
-        
-        # 对抗学习统计
-        print(f"\\n[ADV] ADVERSARIAL LEARNING STATS:")
-        print(f"   Discriminator Fooled:    {epoch_stats.get('discriminator_fooled', 0)} cases")
-        print(f"   GT Corrections Applied:  {epoch_stats.get('ground_truth_corrections', 0)} cases")
-        
-        # 详细生成器探索统计
-        print(f"\\n[GEN] GENERATOR EXPLORATION DETAILS:")
-        print(f"   Query-Level Performance:")
-        print(f"      Queries Processed:    {epoch_stats.get('Queries_Processed', 0)}")
-        print(f"      Queries Solved:       {epoch_stats.get('Queries_Solved', 0)}")
-        print(f"      Queries Failed:       {epoch_stats.get('Queries_Failed', 0)}")
-        print(f"      Query Success Rate:   {epoch_stats.get('Query_Success_Rate', 0):.3f}")
-        print(f"      Avg Attempts/Query:   {epoch_stats.get('Avg_Attempts_Per_Query', 0):.1f}")
-        print(f"   Path-Level Performance:")
-        print(f"      Total Paths Generated: {epoch_stats.get('Generator_Total_Paths', 0)}")
-        print(f"      Correct Paths:        {epoch_stats.get('Generator_Correct_Paths', 0)}")
-        print(f"      Incorrect Paths:      {epoch_stats.get('Generator_Incorrect_Paths', 0)}")
-        print(f"      Generator Accuracy:   {epoch_stats.get('Generator_Accuracy', 0):.3f}")
-        print(f"   Adversarial Analysis:")
-        print(f"      Disc-Gen Agreements:  {epoch_stats.get('Disc_Generator_Agreements', 0)}")
-        print(f"      Disc-Gen Disagreements: {epoch_stats.get('Disc_Generator_Disagreements', 0)}")
-        print(f"      Agreement Rate:       {epoch_stats.get('Agreement_Rate', 0):.3f}")
-        print(f"      Gen Fooled Disc:      {epoch_stats.get('Generator_Fooled_Discriminator', 0)} cases")
-        
-        print("="*80)
+        """显示简洁的epoch指标"""
+        print(f"Epoch {epoch_num + 1} | "
+              f"Loss_D: {epoch_stats.get('Loss_D', 0):.3f} | "
+              f"Acc_R: {epoch_stats.get('Acc_Real', 0):.2f} | "
+              f"Acc_F: {epoch_stats.get('Acc_Fake', 0):.2f} | "
+              f"F1: {epoch_stats.get('F1_Score', 0):.2f} | "
+              f"Avg_Reward: {epoch_stats.get('Avg_Reward', 0):.3f} | "
+              f"Path_Len: {epoch_stats.get('Path_Length_Avg', 0):.1f} | "
+              f"Diversity: {epoch_stats.get('Path_Diversity', 0):.2f} | "
+              f"Hits@1: {epoch_stats.get('Hits_at_1', 0):.2f} | "
+              f"MRR: {epoch_stats.get('MRR', 0):.2f} | "
+              f"Success: {epoch_stats.get('Success_Rate', 0):.2f} | "
+              f"Gen_Fooled: {epoch_stats.get('Generator_Fooled_Discriminator', 0)}")
     
     def train_generator_with_intelligent_reward(self, qa_dataset: List[Dict],
                                               episodes: int = 50) -> float:
         """使用智能奖励训练生成器"""
-        from differentiable_path_generator_truly_fixed import DifferentiablePathGeneratorTrulyFixed
-        
-        if not isinstance(self.generator, DifferentiablePathGeneratorTrulyFixed):
+        # 兼容新的Beam Search生成器和原有生成器
+        if hasattr(self.generator, 'p_rel_network'):
+            # 新的Beam Search生成器
+            return self.train_beam_search_generator(qa_dataset, episodes)
+        else:
+            # 回退到原有方法
             return self.train_generator(qa_dataset, episodes=episodes)
+    
+    def train_beam_search_generator(self, qa_dataset: List[Dict], episodes: int = 50) -> float:
+        """训练新的Beam Search生成器"""
+        # print(f"[BEAM-TRAIN] Training Beam Search generator for {episodes} episodes...")  # 简化输出
         
-        self.generator.train()
-        self.discriminator.eval()
         self.generator.enable_training_mode()
+        self.discriminator.eval()
         
         total_reward = 0.0
         total_episodes = 0
+        successful_episodes = 0
         
         for episode in range(episodes):
             qa_item = random.choice(qa_dataset)
@@ -728,13 +716,13 @@ class GANRLTrainerFixed:
             answer_entities = set(qa_item['answer_entities'])
             
             try:
-                # 生成可微分路径 - 增加温度提高探索性
+                # 使用Beam Search生成可微分路径
                 paths_with_log_probs = self.generator.generate_differentiable_paths(
                     question=question,
                     start_entity=start_entity,
-                    target_entities=answer_entities,
+                    target_entities=set(),  # 不提供答案实体
                     num_samples=1,
-                    temperature=1.5  # 从1.0提高到1.5，增加随机性
+                    temperature=1.5
                 )
                 
                 if not paths_with_log_probs:
@@ -744,38 +732,61 @@ class GANRLTrainerFixed:
                 if len(path) == 0:
                     continue
                 
-                # 获取判别器评分
+                # 构造判别器输入
                 final_entity = path[-1]
                 path_string = '.'.join(path)
                 path_data = [{'paths': {final_entity: [path_string]}}]
                 
+                # 获取判别器评分
                 with torch.no_grad():
                     discriminator_outputs = self.discriminator([question], path_data, epoch=0)
                     
-                    # 使用智能奖励(核心改进!)
-                    intelligent_reward = self.compute_intelligent_reward(
+                    # 使用智能奖励计算
+                    raw_reward = self.compute_intelligent_reward(
                         path, discriminator_outputs[0], answer_entities
                     )
+                    
+                    # 计算优势函数 - REINFORCE方差减少
+                    advantage = self.compute_advantage_with_baseline(raw_reward)
                 
-                # REINFORCE损失
-                policy_loss = -intelligent_reward * path_log_prob
+                # REINFORCE损失：-Advantage * log P(τ)  [使用优势而非原始奖励]
+                policy_loss = -advantage * path_log_prob
                 
                 # 反向传播
                 self.generator_optimizer.zero_grad()
                 policy_loss.backward()
+                
+                # 梯度裁剪
                 torch.nn.utils.clip_grad_norm_(
-                    self.generator.get_trainable_parameters(), max_norm=1.0
+                    list(self.generator.get_trainable_parameters()), max_norm=1.0
                 )
+                
                 self.generator_optimizer.step()
                 
-                total_reward += intelligent_reward
+                # 统计 - 使用原始奖励进行统计，但训练使用优势
+                total_reward += raw_reward
                 total_episodes += 1
                 
+                if final_entity in answer_entities:
+                    successful_episodes += 1
+                
+                # 定期打印进度
+                if (episode + 1) % 10 == 0:
+                    avg_reward = total_reward / max(1, total_episodes)
+                    success_rate = successful_episodes / max(1, total_episodes)
+                    print(f"   Episode {episode+1}/{episodes}: Avg_Reward={avg_reward:.4f}, Success_Rate={success_rate:.3f}")
+                
             except Exception as e:
+                print(f"   Episode {episode+1} failed: {e}")
                 continue
         
         avg_reward = total_reward / max(1, total_episodes)
-        self.training_stats['generator_rewards'].append(avg_reward)
+        final_success_rate = successful_episodes / max(1, total_episodes)
+        
+        print(f"[BEAM-DONE] Generator training completed:")
+        print(f"   Episodes completed: {total_episodes}/{episodes}")
+        print(f"   Average reward: {avg_reward:.4f}")
+        print(f"   Success rate: {final_success_rate:.3f}")
         
         self.generator.disable_training_mode()
         return avg_reward
@@ -821,10 +832,11 @@ class GANRLTrainerFixed:
                 answer_entities = set(qa_item['answer_entities'])
                 
                 # 生成路径
+                # 评估时也不提供答案实体，测试真实生成能力
                 generated_paths = self.generator.generate_paths(
                     question=question,
                     start_entity=start_entity,
-                    target_entities=answer_entities,
+                    target_entities=set(),  # 不提供答案实体
                     max_paths=3,
                     stochastic=False
                 )
@@ -870,11 +882,11 @@ class GANRLTrainerFixed:
                 start_entity = qa_item['question_entity']
                 answer_entities = set(qa_item['answer_entities'])
                 
-                # 生成候选路径
+                # 生成候选路径 - 端到端评估也不提供答案
                 generated_paths = self.generator.generate_paths(
                     question=question,
                     start_entity=start_entity,
-                    target_entities=answer_entities,
+                    target_entities=set(),  # 不提供答案实体，真实评估
                     max_paths=5,
                     stochastic=False
                 )

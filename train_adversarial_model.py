@@ -26,7 +26,7 @@ from typing import List, Dict, Set
 sys.path.append(str(Path(__file__).parent / "models" / "path_discover"))
 sys.path.append(str(Path(__file__).parent / "models" / "path_ranker"))
 
-from differentiable_path_generator_truly_fixed import DifferentiablePathGeneratorTrulyFixed
+from models.path_discover.beam_search_generator import BeamSearchPathGenerator
 from enhanced_path_ranker import EnhancedPathRankerDiscriminator
 from gan_rl_trainer_fixed import GANRLTrainerFixed
 
@@ -144,13 +144,13 @@ class AdversarialTrainingPipeline:
             return False
         
         try:
-            # 生成器
-            self.generator = DifferentiablePathGeneratorTrulyFixed(
+            # 生成器 - 新的Beam Search生成器
+            self.generator = BeamSearchPathGenerator(
                 entity_embedding_path="embeddings/entity_embeddings.pt",
                 max_path_length=6,
                 beam_width=5
             )
-            self.generator.knowledge_graph = self.knowledge_graph
+            self.generator.load_knowledge_graph("graph/knowledge_graph.pkl")
             
             # 判别器
             self.discriminator = EnhancedPathRankerDiscriminator(
@@ -158,11 +158,30 @@ class AdversarialTrainingPipeline:
                 use_pattern_memory=False
             )
             
-            # 训练器
+            # 加载预训练权重
+            try:
+                checkpoint_path = "checkpoints/enhanced_pathranker/best_hits1_model.pth"
+                print(f"Loading discriminator weights from: {checkpoint_path}")
+                checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
+                
+                # 提取model_state_dict
+                if 'model_state_dict' in checkpoint:
+                    model_weights = checkpoint['model_state_dict']
+                else:
+                    model_weights = checkpoint
+                
+                self.discriminator.load_state_dict(model_weights, strict=False)
+                print("Pre-trained discriminator weights loaded successfully")
+            except Exception as e:
+                print(f"Warning: Failed to load discriminator weights: {e}")
+                print("Using randomly initialized discriminator")
+            
+            # 训练器 - 设置判别器阈值为0.8
             self.trainer = GANRLTrainerFixed(
                 self.generator, 
                 self.discriminator, 
-                device=self.device
+                device=self.device,
+                discriminator_threshold=0.8  # 设置阈值为0.8
             )
             
             self.generator.to(self.device)
